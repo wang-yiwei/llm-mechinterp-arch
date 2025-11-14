@@ -273,7 +273,7 @@ class TinyTransformerLM(nn.Module):
         h = x_emb + pos_emb # (batch, seq_len, d_model) -> initial hidden state
 
         # Causal mask
-        attn_mask = self.causal_mask(seq_len, device)  # (1, 1, seq_len, seq_len)
+        attn_mask = self._causal_mask(seq_len, device)  # (1, 1, seq_len, seq_len)
         
         # Transformer blocks & layer normalization
         for block in self.blocks:
