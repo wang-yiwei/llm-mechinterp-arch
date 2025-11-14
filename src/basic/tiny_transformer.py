@@ -30,8 +30,8 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads # multiple heads by the dimension of each head
-        self.attn_dropout = attn_dropout
-        self.proj_dropout = proj_dropout
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.proj_dropout = nn.Dropout(proj_dropout)
 
         # Linear projections for Q, K, V
         self.W_Q = nn.Linear(d_model, d_model)
@@ -266,9 +266,13 @@ class TinyTransformerLM(nn.Module):
 
         # Embedding & positional encoding
         x_emb = self.W_E(x) # (batch, seq_len, d_model)
-        pos_ids = pos_ids or torch.arange(
-            seq_len, device=device
-        ).unsqueeze(0).expand(batch_size, seq_len)
+        if pos_ids is None:
+            pos_ids = torch.arange(
+                seq_len, device=device
+            ).unsqueeze(0).expand(batch_size, seq_len)
+        else:
+            assert pos_ids.shape == (batch_size, seq_len), "Positional IDs must be of shape (batch, seq_len)"
+
         pos_emb = self.W_pos(pos_ids) # (batch, seq_len, d_model)
         h = x_emb + pos_emb # (batch, seq_len, d_model) -> initial hidden state
 
