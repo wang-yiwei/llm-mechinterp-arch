@@ -26,9 +26,38 @@ import torch.nn.functional as F
 
 # --------- RMSNorm ---------
 
+class RMSNorm(nn.Module):
+    """
+    RMSNorm is a normalization technique that scales the input 
+    by the square root of the mean of the squares of the input.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-6
+    )-> None:
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
 
+    def forward(
+        self,
+        x: torch.Tensor,
+    )-> torch.Tensor:
+        """
+        Forward pass for the RMSNorm module.
 
+        Args:
+            x: Input tensor of shape (batch, seq_len, d_model)
 
+        Returns:
+            Output tensor of shape (batch, seq_len, d_model)
+        """
+        rms_norm = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        x_norm = x / rms_norm.sqrt() * self.weight
+        return x_norm
+    
 
 # --------- RoPE helpers ---------
 
