@@ -1,6 +1,6 @@
 #src/basic/tiny_transformer.py
 
-# Author: Yiwei Huang
+# Author: Yiwei Wang
 # Date: 2025-11-14
 
 # Importing the necessary libraries
