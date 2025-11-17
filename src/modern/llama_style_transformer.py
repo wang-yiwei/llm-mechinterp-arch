@@ -17,7 +17,6 @@
 
 # Importing the necessary libraries
 import math
-from turtle import position
 from typing import Optional
 
 import torch
@@ -137,10 +136,14 @@ def apply_rope(
     assert head_dim_q % 2 == 0, "Head dimension must be even for RoPE"
 
     half_dim = head_dim_q // 2
+
+    # (seq_len_q, half_dim)
     cos = cos[:seq_len_q, :half_dim]
     sin = sin[:seq_len_q, :half_dim]  # (seq_len_q, half_dim)
-    cos = cos[None, :, None, :, :]  # (1, 1, seq_len_q, half_dim)
-    sin = sin[None, :, None, :, :]  # (1, 1, seq_len_q, half_dim)
+
+    # reshape to (1, 1, seq_len_q, half_dim) to broadcast over batch & heads
+    cos = cos.view(1, 1, seq_len_q, half_dim)
+    sin = sin.view(1, 1, seq_len_q, half_dim)
 
     # split the heads into pairs and apply the RoPE rotation to each pair
     q_even, q_odd = q[..., 0::2], q[..., 1::2]
@@ -158,6 +161,7 @@ def apply_rope(
     q_out[..., 1::2] = q_rot_odd
     k_out[..., 0::2] = k_rot_even
     k_out[..., 1::2] = k_rot_odd
+    
     return q_out, k_out
 
 
@@ -445,7 +449,6 @@ class LlamaStyleTransformerLM(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        pos_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the LlamaStyleTransformerLM module.
@@ -461,7 +464,7 @@ class LlamaStyleTransformerLM(nn.Module):
         assert seq_len <= self.max_seq_len, "Sequence length must be less than or equal to max_seq_len"
 
         # Embedding & positional encoding
-        x_emb = self.W_E(x) # (batch, seq_len, d_model)
+        h = self.W_E(x) # (batch, seq_len, d_model)
         
         # Causal mask shared across all heads
         attn_mask = self._causal_mask(seq_len, device)  # (1, 1, seq_len, seq_len)
