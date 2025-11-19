@@ -371,7 +371,10 @@ class LlamaStyleTransformerBlock(nn.Module):
 
 class LlamaStyleTransformerLM(nn.Module):
     """
-
+    Decoder-only Transformer language model with:
+    - RoPE applied to Q and K
+    - SwiGLU feed-forward network
+    - optional grouped-query attention (GQA) via n_kv_heads < n_heads
     """
     
     def __init__(
