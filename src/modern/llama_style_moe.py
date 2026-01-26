@@ -124,6 +124,8 @@ class LlamaStyleMoEFFN(nn.Module):
             return mixed_expert_outputs, None
 
 
+# --------- Load Balancing Loss ---------
+
     @staticmethod
     def moe_load_balancing_loss(router_logits: torch.Tensor) -> torch.Tensor:
         """
@@ -150,3 +152,51 @@ class LlamaStyleMoEFFN(nn.Module):
 
 
 # --------- LlamaStyle MoE Transformer Block ---------
+
+class LlamaStyleMoETransformerBlock(nn.Module):
+    """
+    Llama-style Transformer block where the FFN is replaced by a Mixture of Experts (MoE) FFN.
+
+    Structure:
+        x -> RMSNorm
+        -> RoPE + GQA Attention
+        -> residual connection
+        -> RMSNorm
+        -> MoE (SwiGLU experts + top-k sparse router + load-balancing loss)
+        -> residual connection
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        num_experts: int = 16,
+        top_k: int = 2,
+        n_kv_heads: Optional[int] = None,
+        attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        max_seq_len: int = 2048,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.attn = LlamaStyleAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            attn_dropout=attn_dropout,
+            proj_dropout=attn_dropout,
+            max_seq_len=max_seq_len,
+            rope_base=rope_base,
+        )
+        self.moe = LlamaStyleMoEFFN(
+            d_model=d_model,
+            d_ff=d_ff,
+            num_experts=num_experts,
+            top_k=top_k,dropout=ffn_dropout,
+            load_balancing_loss=True,
+        )
+    
+
