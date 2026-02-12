@@ -7,11 +7,13 @@
 
 # Information about the script:
 # This script implements a MoE FFN layer with the following features:
+# - Experts: SwiGLU MLPs (same as dense LLaMA/Qwen FFN)
+# - Router: linear gate from hidden state -> logits over experts
+# - top_k: sparse routing (top-k experts per token)
+# - Optional MoE layers at user-specified indices in the stack
 
 
 # Importing the necessary libraries
-import math
-from optparse import Option
 from typing import Optional, List, Tuple
 
 import torch
@@ -19,7 +21,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # relative imports
-from src.modern.llama_style_transformer import LlamaStyleTransformerBlock, RMSNorm, SwiGLU, LlamaStyleAttention
+from src.modern.llama_style_transformer import (
+    LlamaStyleTransformerBlock,
+    RMSNorm,
+    SwiGLU,
+    LlamaStyleAttention,
+)
 
 
 # --------- MoE FFN Layer ---------
@@ -47,10 +54,8 @@ class LlamaStyleMoEFFN(nn.Module):
         num_experts: int,
         top_k: int = 2,
         dropout: float = 0.0,
-        load_balancing_loss: bool = True,
     ) -> None:
         super().__init__()
-        assert d_model % num_experts == 0, "d_model must be divisible by num_experts"
         assert top_k <= num_experts, "top_k must be <= num_experts"
 
         self.d_model = d_model
@@ -78,7 +83,7 @@ class LlamaStyleMoEFFN(nn.Module):
         self,
         x: torch.Tensor,
         return_router_logits: bool = False,
-    ) -> Tuple[torch.Tensor. Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         x: (batch_size, seq_len, d_model)
         """
@@ -100,7 +105,7 @@ class LlamaStyleMoEFFN(nn.Module):
                 k=self.top_k,
                 dim=-1,
             ) # (N, top_k)
-            mask = torch.zeros_like(router_probs) # to
+            mask = torch.zeros_like(router_probs) # Mask out all but top-k experts
             mask.scatter_(
                 dim=1,
                 index=top_k_router_idx,
@@ -120,7 +125,8 @@ class LlamaStyleMoEFFN(nn.Module):
         mixed_expert_outputs = mixed_expert_outputs.view(batch_size, seq_len, d_model) # back to the original shape
 
         if return_router_logits:
-            return mixed_expert_outputs, router_logits.view(batch_size, seq_len, self.num_experts)
+            router_logits_bt = router_logits.view(batch_size, seq_len, self.num_experts)
+            return mixed_expert_outputs, router_logits_bt
         else:
             return mixed_expert_outputs, None
 
@@ -137,7 +143,15 @@ class LlamaStyleMoEFFN(nn.Module):
         Returns:
             Load balancing loss: scalar
         """
-        router_probs = F.softmax(router_logits, dim=-1) # (N, num_experts)
+        if router_logits.dim() == 3:
+            batch_size, seq_len, num_experts = router_logits.shape
+            rl = router_logits.view(batch_size * seq_len, num_experts) # flatten over tokens
+        elif router_logits.dim() == 2:
+            rl = router_logits
+        else:
+            raise ValueError("router_logits must be a 2D or 3D tensor")
+
+        router_probs = F.softmax(rl, dim=-1) # (N, num_experts)
         expert_probs = router_probs.mean(dim=0) # (num_experts,): average over the batch dimension
         target_probs = torch.full_like(
             expert_probs,
@@ -196,8 +210,8 @@ class LlamaStyleMoETransformerBlock(nn.Module):
             d_model=d_model,
             d_ff=d_ff,
             num_experts=num_experts,
-            top_k=top_k,dropout=ffn_dropout,
-            load_balancing_loss=True,
+            top_k=top_k,
+            dropout=ffn_dropout,
         )
     
     def forward(
@@ -224,17 +238,22 @@ class LlamaStyleMoETransformerBlock(nn.Module):
 
         # MoE FFN
         h = x
+        x_norm = self.ln2(x)
         f, router_logits = self.moe(
-            x,
+            x_norm,
             return_router_logits=return_router_logits,
         )
         x = h + f # residual connection
 
-        if return_load_balancing_loss:
+        load_balancing_loss = None
+        if return_router_logits:
             load_balancing_loss = LlamaStyleMoEFFN.moe_load_balancing_loss(router_logits)
-            return x, router_logits, load_balancing_loss
-        else:
-            return x, router_logits, None
+
+        # If caller didn't want router_logits, hide them
+        if not return_router_logits:
+            router_logits = None
+        
+        return x, router_logits, load_balancing_loss
 
 
 # --------- LlamaStyle MoE Transformer Language Model ---------
@@ -264,7 +283,6 @@ class LlamaStyleMoETransformerLM(nn.Module):
         num_experts: int = 16,
         top_k: int = 2,
         moe_layer_indices: Optional[List[int]] = None,
-        moe_load_balancing_loss: bool = True,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -279,18 +297,20 @@ class LlamaStyleMoETransformerLM(nn.Module):
         self.rope_base = rope_base
         self.num_experts = num_experts
         self.top_k = top_k
-        self.moe_layer_indices = moe_layer_indices
-        self.moe_load_balancing_loss = moe_load_balancing_loss
 
-        assert moe_layer_indices is None or all(0 <= idx < n_layers for idx in moe_layer_indices), "moe_layer_indices must be a list of integers between 0 and n_layers - 1"
-        assert moe_load_balancing_loss is True, "moe_load_balancing_loss must be True"
+        # validate moe_layer_indices
+        if moe_layer_indices is None:
+            moe_layer_indices = list(range(n_layers))
+        else:
+            assert all(0 <= idx < n_layers for idx in moe_layer_indices), (
+                "moe_layer_indices must be a list of integers between 0 and n_layers - 1"
+            )
+        self.moe_layer_indices = moe_layer_indices
 
         # Token + positional embeddings
         self.W_E = nn.Embedding(vocab_size, d_model)
 
-        # MoE Transformer blocks
-        if moe_layer_indices is None:
-            moe_layer_indices = list(range(n_layers)) # use all layers as MoE layers
+        # MoE Transformer blocks (mix of MoE and regular LLaMA/Qwen Transformer blocks)
         blocks = []
         for layer_idx in range(n_layers):
             if layer_idx in moe_layer_indices:
@@ -360,14 +380,18 @@ class LlamaStyleMoETransformerLM(nn.Module):
         x: torch.Tensor,
         return_router_logits: bool = False,
         return_load_balancing_loss: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[List[torch.Tensor]],
+        Optional[List[torch.Tensor]],
+    ]:
         """
         x: (batch_size, seq_len)
 
         Returns:
             x: (batch_size, seq_len, d_model)
-            router_logits: (batch_size, seq_len, num_experts) if return_router_logits is True
-            load_balancing_loss: (batch_size, seq_len) if return_load_balancing_loss is True
+            router_logits: List of (batch_size, seq_len, num_experts) if return_router_logits is True
+            load_balancing_loss: List of (batch_size, seq_len) if return_load_balancing_loss is True
         """
         batch_size, seq_len = x.shape
         device = x.device
@@ -392,9 +416,9 @@ class LlamaStyleMoETransformerLM(nn.Module):
                     return_router_logits=return_router_logits,
                     return_load_balancing_loss=return_load_balancing_loss,
                 )
-                if return_router_logits:
+                if return_router_logits and router_logits is not None:
                     all_router_logits.append(router_logits)
-                if return_load_balancing_loss:
+                if return_load_balancing_loss and load_balancing_loss is not None:
                     all_load_balancing_loss.append(load_balancing_loss)
             else:
                 # regular Transformer blocks return (h)
@@ -405,15 +429,12 @@ class LlamaStyleMoETransformerLM(nn.Module):
         h = self.final_norm(h)
         logits = self.W_U(h)
 
-        return (
-            logits,
-            all_router_logits if return_router_logits else None,
-            all_load_balancing_loss if return_load_balancing_loss else None,
-        )
+        return logits, all_router_logits, all_load_balancing_loss
 
 if __name__ == "__main__":
+    vocab_size = 100
     model = LlamaStyleMoETransformerLM(
-        vocab_size=100,
+        vocab_size=vocab_size,
         d_model=256,
         n_heads=4,
         d_ff=1024,
@@ -421,8 +442,21 @@ if __name__ == "__main__":
         max_seq_len=128,
         n_kv_heads=2,
         rope_base=10000.0,
-        num_experts=16,
+        num_experts=8,
         top_k=2,
-        moe_layer_indices=None,
-        moe_load_balancing_loss=True,
+        moe_layer_indices=[1],
     )
+    x = torch.randn(0, vocab_size, (2, 128))
+    logits, all_router_logits, all_load_balancing_loss = model(
+        x,
+        return_router_logits=True,
+        return_load_balancing_loss=True,
+    )
+
+    print("logits shape:", logits.shape)
+    if all_router_logits is not None:
+        print("all_router_logits shape:", [router_logits.shape for router_logits in all_router_logits])
+        print("router_logits[0]:", all_router_logits[0].shape)
+    if all_load_balancing_loss is not None:
+        print("all_load_balancing_loss shape:", [load_balancing_loss.shape for load_balancing_loss in all_load_balancing_loss])
+        print("load_balancing_loss[0]:", all_load_balancing_loss[0].shape)
