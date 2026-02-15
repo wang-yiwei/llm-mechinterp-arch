@@ -109,7 +109,7 @@ class LlamaStyleMoEFFN(nn.Module):
             mask.scatter_(
                 dim=1,
                 index=top_k_router_idx,
-                src=1.0, # set the top_k values to 1.0
+                src=torch.ones_like(top_k_router_values), # set the top_k values to 1.0
             )
             router_probs = router_probs * mask # (N, num_experts)
             router_probs = router_probs / (router_probs.sum(dim=-1, keepdim=True) + 1e-9) # normalize the probabilities to sum to 1
