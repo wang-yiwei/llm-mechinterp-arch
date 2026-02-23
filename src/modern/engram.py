@@ -21,6 +21,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.training_args import OptimizerNames
 
 
 try:
@@ -190,6 +191,9 @@ class CompressTokenizer:
 
 # --------------------
 # Prime moduli helper (per head, per n-gram, per layer)
+
+# Moduli is the prime numbers for each head per ngram per layer,
+# while multipliers are the odd integers for each ngram per layer.
 # --------------------
 
 def _find_next_prime(
@@ -279,4 +283,170 @@ class EngramConfig:
 
 
 class NgramHashMapping(nn.Module):
+    """
+    Produces hash ids:
+        hash_ids[layer_id]: (batch, seq_len, head_total_size)
+    where head_total_size = (max_ngram_size - 1) * n_head_per_ngram
+
+    Core logic mirrors the implementation in the demo:
+      - layer-specific odd multipliers (2, 3, 5, 7, 11, 13, 17, 19)
+      - shift_k padding with pad_id 
+      - XOR mixing
+      - per-head mod with primes-per-head    
+    """
+    def __init__(self, cfg: EngramConfig):
+        super().__init__()
+        self.cfg = cfg
+        assert cfg.max_ngram_size >= 2
+        assert len (cfg.vocab_size_per_ngram) == (cfg.max_ngram_size - 1)
+
+        # tokenizer & compressor
+        self.char_tokenizer: Optional[CharTokenizer] = None
+        self.compressed: Optional[CompressTokenizer] = None
+
+        if cfg.tokenizer_type == "char":
+            self.char_tokenizer = CharTokenizer()
+            self.tokenizer_vocab_size = None
+            self.pad_token_id = cfg.pad_token_id
+        else:
+            # HF tokenizer (optionally compressed)
+            if cfg.use_compressed_tokenizer:
+                self.compressed = CompressTokenizer(
+                    tokenizer_name_or_path=cfg.tokenizer_name_or_path,
+                    trust_remote_code=cfg.trust_remote_code,
+                    pad_token_id=cfg.pad_token_id,
+                )
+                self.tokenizer_vocab_size = len(self.compressed)
+                self.pad_token_id = int(self.compressed.pad_token_id) if self.compressed.pad_token_id is not None else cfg.pad_token_id
+            else:
+                # uncompressed HF tokenizer
+                if AutoTokenizer is None:
+                    raise ImportError("Need transformers to use HF tokenizer.")
+                tokenizer = AutoTokenizer.from_pretrained(
+                    cfg.tokenizer_name_or_path,
+                    trust_remote_code=cfg.trust_remote_code,
+                )
+                self.tokenizer_vocab_size = len(tokenizer)
+                self.pad_token_id = cfg.pad_token_id
         
+        # layer-specific multipliers (odd int64s)
+        self.layer_multipliers: Dict[int, torch.Tensor] = {}
+        for layer_id in cfg.layer_ids:
+            base_seed = int(cfg.seed + cfg.prime_seed_constant * int(layer_id))
+            g = torch.Generator()
+            g.manual_seed(base_seed)
+            # generate random multipliers, then force odd integers
+            r = torch.randint(
+                low=0,
+                high=2**30,
+                size=(cfg.max_ngram_size,),
+                generator=g,
+                dtype=torch.int64,
+            )
+            multipliers = r * 2 + 1
+            self.layer_multipliers[int(layer_id)] = multipliers
+
+        
+        # prime moduli per head per ngram per layer - layer_id -> ngram_index -> head_index
+        moduli = build_prime_moduli(
+            layer_ids=cfg.layer_ids,
+            vocab_size_per_ngram=cfg.vocab_size_per_ngram,
+            max_ngram_size=cfg.max_ngram_size,
+            n_head_per_ngram=cfg.n_head_per_ngram,
+        )
+
+        # store moduli in a tensor for each layer
+        self.layer_moduli: Dict[int, torch.Tensor] = {}
+        for layer_id in cfg.layer_ids:
+            self.layer_moduli[layer_id] = torch.tensor(
+                moduli[int(layer_id)],
+                dtype=torch.int64,
+            )
+        
+    def compress_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.compressed is None:
+            return input_ids
+        return self.compressed.compress(input_ids)
+
+    @staticmethod
+    def _shift_left_pad(
+        x: torch.Tensor,
+        k: int,
+        pad_token_id: int,
+    ) -> torch.Tensor:
+        """
+        Shift left and pad with pad_token_id.
+        Args:
+            x: Input tensor of shape (batch, seq_len)
+            k: Number of positions to shift left
+            pad_token_id: Token ID to use for padding
+        Returns:
+            Shifted and padded tensor of shape (batch, seq_len + k)
+        """
+        if k == 0:
+            return x
+        batch_size, seq_len = x.shape
+        return F.pad(
+            x,
+            (k, 0),
+            value=pad_token_id,
+        )[:, :seq_len]
+
+    def _hash_for_layer(
+        self,
+        input_ids: torch.Tensor,
+        layer_id: int
+    ) -> torch.Tensor:
+        """
+        input_ids: (batch_size, seq_len)
+        return: (batch_size, seq_len, head_total_size)
+        """
+        cfg = self.cfg
+        layer_id = int(layer_id)
+
+        x = input_ids.to(torch.int64)
+        batch_size, seq_len = x.shape
+
+        multipliers = self.layer_multipliers[layer_id].to(x.device)
+        moduli = self.layer_moduli[layer_id].to(x.device)
+
+        # shifts[0..max_ngram_size-1]: (max_ngram_size,)
+        shifts = [
+            self._shift_left_pad(x, k, self.pad_token_id)
+            for k in range(cfg.max_ngram_size)
+        ]
+
+        all_hashes = []
+        for n in range(2, cfg.max_ngram_size + 1):
+            ngram_index = n - 2  # we use 2-gram as base index
+            token_ids = shifts[:n]
+
+            mix = token_ids[0] * multipliers[0]
+            for k in range(1, n):
+                mix = torch.bitwise_xor(
+                    mix,
+                    token_ids[k] * multipliers[k]
+                )
+
+            # per head mod with prime moduli
+            for h in range(cfg.n_head_per_ngram):
+                m = int(moduli[ngram_index, h].item()) # structure of moduli: layer_id -> ngram_index -> head_index
+                all_hashes.append(mix % m).to(torch.int64)
+        
+        return torch.stack(all_hashes, dim=-1) #stacks the hashes for all ngrams along the last dimension
+
+    def hash(
+        self,
+        input_ids: torch.Tensor,
+    ) -> Dict[int, torch.Tensor]:
+        """
+        input_ids: (batch_size, seq_len)
+        return dict: {layer_id: hash_ids(batch_size, seq_len, head_total_size)}
+        """
+        x = self.compress_ids(input_ids)
+        return {
+            int(layer_id): self._hash_for_layer(x, int(layer_id)) for layer_id in self.cfg.layer_ids
+        }
+
+        
+
