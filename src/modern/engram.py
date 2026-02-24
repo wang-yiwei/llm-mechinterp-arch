@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from turtle import forward
 from typing import Dict, List, Optional, Tuple
 
 
@@ -448,5 +449,92 @@ class NgramHashMapping(nn.Module):
             int(layer_id): self._hash_for_layer(x, int(layer_id)) for layer_id in self.cfg.layer_ids
         }
 
+
+# --------------------
+# Multi-head embedding + lookup (separate from gate and fusion)
+# --------------------
+
+class MultiHeadEmbedding(nn.Module):   
+    """
+    Using multiple heads for the embedding lookup to improve the performance of the model by allowing the model to learn different representations (different n-grams) of the input data.
+    As suggested in the demo, pack multiple heads into one nn.Embedding module by using offsets.
+    """
+
+    def __init__(
+        self,
+        head_sizes: List[int],
+        head_dim: int,
+    ) -> None:
+        super().__init__()
+        self.head_sizes = [int(n) for n in head_sizes]
+        self.head_dim = int(head_dim)
+
+        offsets = [0]
+        for n in self.head_sizes[:-1]:  # last element is the total number of heads, we don't need to add it to the offsets.
+            offsets.append(offsets[-1] + n) # adds the number of heads to the previous offset.
+        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long), persistent=False)
+
+        total = sum(self.head_sizes)
+        self.embedding = nn.Embedding(total, self.head_dim)
+
+    def forward(self, head_ids: torch.Tensor) -> torch.Tensor:
+        # head_ids: (batch_size, seq_len, head_total_size)
+        shifted = head_ids + self.offsets.view(1, 1, -1).to(device=head_ids.device)
+        return self.embedding(shifted) # (batch_size, seq_len, head_total_size, head_dim)
+
+
+class EngramLookup(nn.Module):
+    """
+    Pure lookup module that does not use any activation functions:
+      input_ids -> hash_ids -> embedding lookup -> flattened memory vector
+    No gating or fusion in this module
+    """
+    def __init__(
+        self,
+        cfg: EngramConfig,
+        layer_id: int,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.layer_id = int(layer_id)
+        self.hash_mapping = NgramHashMapping(cfg)
+
+        # Build head_sizes for this layer (flatten across ngram orders)
+        # Using prime mmoduli list, so head_sizes = primes per head
+        moduli = self.hash_mapping.layer_moduli[self.layer_id] # (ngram_order, heads)
+        head_sizes = [
+            int(x) for x in moduli.flatten().tolist()
+        ]
+        self.head_total_size = len(head_sizes)
+        head_dim = cfg.n_embed_per_ngram // cfg.n_head_per_ngram # total embedding dimension divided by the number of heads
+        self.head_dim = head_dim
+
+        self.multi_head_embedding = MultiHeadEmbedding(
+            head_sizes=head_sizes,
+            head_dim=head_dim,
+        )
         
+        # flattened memory vector dimension
+        # (max_ngram_size - 1) * n_head_per_ngram  = mem_dim, because head_total_size = (max_ngram_size - 1) * n_head_per_ngram
+        self.mem_dim = self.head_total_size * self.head_dim
+
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            memory_vector: (batch_size, seq_len, mem_dim)
+            memory_weights: (batch_size, seq_len, head_total_size)
+        """
+        hash_ids = self.hash_mapping.hash(input_ids)[self.layer_id]  # (batch_size, seq_len, head_total_size)
+        embedding = self.multi_head_embedding(hash_ids) # (batch_size, seq_len, head_total_size, head_dim)
+        mem_flattened = embedding.view(start_dim=-2) # reshape the embedding tensor to (batch_size, seq_len, mem_dim)
+        return mem_flattened, hash_ids
+
+
+
+# --------------------
+# Gating & fusion module
+# --------------------
+
+
+
 
