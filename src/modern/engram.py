@@ -535,6 +535,24 @@ class EngramLookup(nn.Module):
 # Gating & fusion module
 # --------------------
 
+class EngramKVProjector(nn.Module):
+    def __init__(
+        self,
+        mem_dim: int,
+        d_model: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.key_proj = nn.Linear(mem_dim, d_model, bias=bias)
+        self.value_proj = nn.Linear(mem_dim, d_model, bias=bias)
+    
+    def forward(
+        self,
+        mem_flat: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.key_proj(mem_flat), self.value_proj(mem_flat)
+
+
 
 
 
