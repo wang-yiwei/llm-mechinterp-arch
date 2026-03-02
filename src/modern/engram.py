@@ -94,13 +94,15 @@ class CharTokenizer:
         return "".join(out)
 
 
-class CompressTokenizer:
+class CompressTokenizer(nn.Module):
     """
     DeepSeek-style token-ID compression:
     - decode each token id -> normalise text (NFKC/NFD/StripAccents/Lowercase/whitespace) -> merge duplicates
     - build lookup table: old_id -> new_id
     
     This works only for HF-style tokenizers where decode(id) is meaningful.
+
+    We register the lookup table as a buffer so PyTorch natively tracks its device status.
     """
     def __init__(
         self,
@@ -108,7 +110,7 @@ class CompressTokenizer:
         trust_remote_code: bool = False,
         pad_token_id: Optional[int] = None,
     ) -> None:
-        
+        super().__init__()
         if AutoTokenizer is None or normalizers is None or Regex is None:
             raise ImportError(
                 "Need transformers, tokenizers, and sympy to use CompressTokenizer"
@@ -135,6 +137,14 @@ class CompressTokenizer:
             self.lookup_table,
             dtype=torch.long,
         )
+        self.register_buffer(
+            "lookup_table_torch",
+            torch.tensor(
+                self.lookup_table,
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
     
         if pad_token_id is not None:
             # map HF pad_token_id to new pad_token_id
@@ -142,52 +152,52 @@ class CompressTokenizer:
         else:
             self.pad_token_id = None
         
-        def __len__(self) -> int:
-            return len(self.num_new_tokens)
+    def __len__(self) -> int:
+        return self.num_new_tokens
 
-        def _build_lookup_table(self):
-            import numpy as np
+    def _build_lookup_table(self):
+        import numpy as np
 
-            old_to_new: Dict[int, int] = {}
-            key_to_new: Dict[str, int] = {}
-            new_tokens: List[str] = []
+        old_to_new: Dict[int, int] = {}
+        key_to_new: Dict[str, int] = {}
+        new_tokens: List[str] = []
 
-            vocab_size = len(self.tokenizer)
-            for old_id in range(vocab_size):
-                text = self.tokenizer.decode(
-                    [old_id],
-                    skip_special_tokens=False,
-                )
-                # deepseek employs a special handling if decode contains "�"
-                if "�" in text:
-                    key = self.tokenizer.convert_ids_to_tokens(old_id)
-                else:
-                    norm = self.normalizer.normalize_str(text)
-                    key = norm if norm else text
-                
-                new_id = key_to_new.get(key)
-                if new_id is None:
-                    new_id = len(new_tokens)
-                    key_to_new[key] = new_id
-                    new_tokens.append(key)
-                old_to_new[old_id] = new_id
+        vocab_size = len(self.tokenizer)
+        for old_id in range(vocab_size):
+            text = self.tokenizer.decode(
+                [old_id],
+                skip_special_tokens=False,
+            )
+            # deepseek employs a special handling if decode contains "�"
+            if "�" in text:
+                key = self.tokenizer.convert_ids_to_tokens(old_id)
+            else:
+                norm = self.normalizer.normalize_str(text)
+                key = norm if norm else text
             
-            lookup = np.empty(vocab_size, dtype=np.int64)
-            for old_id in range(vocab_size):
-                lookup[old_id] = old_to_new[old_id]
-            
-            return lookup, len(new_tokens)
+            new_id = key_to_new.get(key)
+            if new_id is None:
+                new_id = len(new_tokens)
+                key_to_new[key] = new_id
+                new_tokens.append(key)
+            old_to_new[old_id] = new_id
+        
+        lookup = np.empty(vocab_size, dtype=np.int64)
+        for old_id in range(vocab_size):
+            lookup[old_id] = old_to_new[old_id]
+        
+        return lookup, len(new_tokens)
 
-        def compress(
-            self,
-            input_ids: torch.Tensor,
-        ) -> torch.Tensor:
-            """
-            input_ids: (batch, seq_len)
-            return: (batch, seq_len), compressed input_ids of the same shape
-            """
-            lut = self.lookup_table_torch.to(device=input_ids.device)
-            return lut[input_ids]
+    def compress(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        input_ids: (batch, seq_len)
+        return: (batch, seq_len), compressed input_ids of the same shape
+        """
+        lut = self.lookup_table_torch.to(device=input_ids.device)
+        return lut[input_ids]
 
 
 # --------------------
@@ -278,9 +288,14 @@ class EngramConfig:
     # fusion
     use_conv: bool = True
     conv_kernel_size: int = 4
+    conv_dilation: Optional[int] = None
 
     # gating transform
     gate_signed_sqrt: bool = True
+
+    def __post_init__(self):
+        if self.use_conv and self.conv_dilation is None:
+            self.conv_dilation = self.max_ngram_size
 
 
 class NgramHashMapping(nn.Module):
@@ -431,8 +446,8 @@ class NgramHashMapping(nn.Module):
 
             # per head mod with prime moduli
             for h in range(cfg.n_head_per_ngram):
-                m = int(moduli[ngram_index, h].item()) # structure of moduli: layer_id -> ngram_index -> head_index
-                all_hashes.append(mix % m).to(torch.int64)
+                m = moduli[ngram_index, h] # structure of moduli: layer_id -> ngram_index -> head_index , assuming moduli is already on the correct device
+                all_hashes.append((mix % m).to(torch.int64)) # append the hash for the current ngram and head
         
         return torch.stack(all_hashes, dim=-1) #stacks the hashes for all ngrams along the last dimension
 
@@ -526,7 +541,7 @@ class EngramLookup(nn.Module):
         """
         hash_ids = self.hash_mapping.hash(input_ids)[self.layer_id]  # (batch_size, seq_len, head_total_size)
         embedding = self.multi_head_embedding(hash_ids) # (batch_size, seq_len, head_total_size, head_dim)
-        mem_flattened = embedding.view(start_dim=-2) # reshape the embedding tensor to (batch_size, seq_len, mem_dim)
+        mem_flattened = embedding.flatten(start_dim=-2) # reshape the embedding tensor to (batch_size, seq_len, mem_dim)
         return mem_flattened, hash_ids
 
 
@@ -585,12 +600,9 @@ class EngramContextGate(nn.Module):
         query = self.norm_query(hidden_states)
 
         gated_score = (key * query).sum(dim=-1) / math.sqrt(d_model) # (batch_size, seq_len)
-
-        if self.use_signed_sqrt:
-            signed_score = gated_score.abs().clamp_min(1e-6).sqrt() * gated_score.sign()
+        signed_score = gated_score.abs().clamp_min(1e-6).sqrt() * gated_score.sign() if self.use_signed_sqrt else gated_score
         
-        gate = torch.sigmoid(signed_score).unsqueeze(-1)   # broadcast the gate to the same shape as the hidden_states (batch_size, seq_len, 1)
-        return gate
+        return torch.sigmoid(signed_score).unsqueeze(-1)   # broadcast the gate to the same shape as the hidden_states (batch_size, seq_len, 1)
 
 
 class DepthwiseCausalConvid(nn.Module):
@@ -598,10 +610,12 @@ class DepthwiseCausalConvid(nn.Module):
         self,
         d_model: int,
         kernel_size: int = 4,
+        dilation: int = 3,
     ):
         super().__init__()
         self.d_model = d_model
         self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
         
         # use Conv1d to process the input tensor along the last dimension
         self.conv = nn.Conv1d(
@@ -610,7 +624,8 @@ class DepthwiseCausalConvid(nn.Module):
             kernel_size=kernel_size,
             groups=d_model,
             bias=False,
-            padding=self.kernel_size - 1,
+            padding=(self.kernel_size - 1) * self.dilation,  # updating padding to be the same as the dilation
+            dilation=self.dilation,
         )
     
     def forward(
@@ -640,12 +655,14 @@ class EngramFusion(nn.Module):
         d_model: int,
         use_conv: bool = True,
         conv_kernel_size: int = 4,
+        conv_dilation: int = 3,
     ):
         super().__init__()
         self.use_conv = bool(use_conv)
         self.conv = DepthwiseCausalConvid(
             d_model=d_model,
             kernel_size=conv_kernel_size,
+            dilation=conv_dilation,
         ) if self.use_conv else None
 
     def forward(
@@ -656,7 +673,7 @@ class EngramFusion(nn.Module):
         # gate: (batch_size, seq_len, 1), value: (batch_size, seq_len, d_model)
         delta = gate * value # (batch_size, seq_len, d_model)
         if self.use_conv:
-            delta = self.conv(delta) # (batch_size, seq_len, d_model) , injects the delta value back into the hidden states
+            delta = delta + self.conv(delta) # (batch_size, seq_len, d_model) , injects the delta value back into the hidden states
         return delta
 
 

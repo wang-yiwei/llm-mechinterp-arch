@@ -99,6 +99,7 @@ class LlamaStyleEngramMoETransformerBlock(nn.Module):
                 d_model=d_model,
                 use_conv=engram_config.use_conv,
                 conv_kernel_size=engram_config.conv_kernel_size,
+                conv_dilation=engram_config.conv_dilation,
             )
         else:
             self.lookup = None
@@ -293,7 +294,7 @@ class LlamaStyleEngramMoETransformerLM(nn.Module):
         torch.Tensor,
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
-        Optional[Dict[str, torch.Tensor]],
+        Optional[List[Dict[str, torch.Tensor]]],
     ]:
         """
         Forward pass for the LlamaStyleEngramMoETransformerLM module.
@@ -305,6 +306,9 @@ class LlamaStyleEngramMoETransformerLM(nn.Module):
 
         Returns:
             logits: (batch_size, seq_len, vocab_size)
+            router_logits: List of (batch_size, seq_len, num_experts) if return_router_logits is True
+            load_balancing_loss: List of (batch_size, seq_len) if return_load_balancing_loss is True
+            engram_aux: List of Dict[str, torch.Tensor] if return_engram_aux is True
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
