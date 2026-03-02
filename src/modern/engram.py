@@ -553,6 +553,110 @@ class EngramKVProjector(nn.Module):
         return self.key_proj(mem_flat), self.value_proj(mem_flat)
 
 
+class EngramContextGate(nn.Module):
+    """
+    Context-aware gating mechanism:
+      - score = <norm(key) , norm(query)> / sqrt(d_model)
+      - applies a signed-sqrt scaling to the score to stabilize the gradient before sigmoid
+      - sigmoid(score) -> gating weights
+    """
+    def __init__(
+        self,
+        d_model: int,
+        use_signed_sqrt: bool = True,
+    ):
+        super().__init__()
+        self.norm_key = nn.RMSNorm(d_model)
+        self.norm_query = nn.RMSNorm(d_model)
+        self.use_signed_sqrt = bool(use_signed_sqrt)
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        hidden_states: (batch_size, seq_len, d_model)
+        key: (batch_size, seq_len, d_model)
+        returns gate: (batch_size, seq_len, 1)
+        """
+        d_model = hidden_states.size(-1)
+        key = self.norm_key(key)
+        query = self.norm_query(hidden_states)
+
+        gated_score = (key * query).sum(dim=-1) / math.sqrt(d_model) # (batch_size, seq_len)
+
+        if self.use_signed_sqrt:
+            signed_score = gated_score.abs().clamp_min(1e-6).sqrt() * gated_score.sign()
+        
+        gate = torch.sigmoid(signed_score).unsqueeze(-1)   # broadcast the gate to the same shape as the hidden_states (batch_size, seq_len, 1)
+        return gate
+
+
+class DepthwiseCausalConvid(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        kernel_size: int = 4,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.kernel_size = int(kernel_size)
+        
+        # use Conv1d to process the input tensor along the last dimension
+        self.conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            groups=d_model,
+            bias=False,
+            padding=self.kernel_size - 1,
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x: (batch_size, seq_len, d_model)
+        returns: (batch_size, seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+        y = self.conv(
+            x.transpose(1,2)  # (batch_size, d_model, seq_len)
+        )
+        y = y[..., :seq_len] # crops the output tensor to the same length as the input tensor due to a delay of kernel_size - 1.
+        return y.transpose(1,2) # (batch_size, seq_len, d_model)
+
+
+class EngramFusion(nn.Module):
+    """
+     - Turns (gate, value) pairs into a delta value: delta = value * gate
+     - Applies depthwise causal convolution to the delta value: delta = depthwise_conv(delta)
+     - Injects the delta value back into the hidden states: hidden_states += delta
+    """
+    def __init__(
+        self,
+        d_model: int,
+        use_conv: bool = True,
+        conv_kernel_size: int = 4,
+    ):
+        super().__init__()
+        self.use_conv = bool(use_conv)
+        self.conv = DepthwiseCausalConvid(
+            d_model=d_model,
+            kernel_size=conv_kernel_size,
+        ) if self.use_conv else None
+
+    def forward(
+        self,
+        gate: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        # gate: (batch_size, seq_len, 1), value: (batch_size, seq_len, d_model)
+        delta = gate * value # (batch_size, seq_len, d_model)
+        if self.use_conv:
+            delta = self.conv(delta) # (batch_size, seq_len, d_model) , injects the delta value back into the hidden states
+        return delta
 
 
