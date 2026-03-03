@@ -22,7 +22,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.training_args import OptimizerNames
 
 
 try:
