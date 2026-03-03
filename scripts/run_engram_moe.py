@@ -15,8 +15,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.modern.llama_style_moe import all_load_balancing_loss, logits
-
 # make repo root importable
 ROOT = Path(__file__).resolve().parent[1]
 sys.path.append(str(ROOT))
@@ -39,7 +37,7 @@ def chunkify(
     # make (batch_size, seq_len+1) chunks of ids
     n = (len(ids) // (seq_len + 1)) * (seq_len + 1)
     ids = ids[:n]
-    x = torch.tensor(ids, dtype=torch.long, device=ids.device).view(-1, seq_len + 1)  # reshapes the tensor into a 2D tensor with shape (batch_size, seq_len + 1)
+    x = torch.tensor(ids, dtype=torch.long).view(-1, seq_len + 1)  # reshapes the tensor into a 2D tensor with shape (batch_size, seq_len + 1)
     return x[:, :-1], x[:, 1:]  # returns the first seq_len tokens and the last seq_len tokens
 
 def main():
@@ -127,7 +125,7 @@ def main():
 
 
     # forward pass
-    logits, all_router_logits, all_load_balancing_loss, engram_aus = model(
+    logits, all_router_logits, all_load_balancing_loss, engram_aux = model(
         x,
         return_router_logits=True,
         return_load_balancing_loss=True,
@@ -137,7 +135,7 @@ def main():
     print("logits shape:", logits.shape)
     print("num router layers:", len(all_router_logits) if all_router_logits is not None else None)
     print("num load balancing losses:", len(all_load_balancing_loss) if all_load_balancing_loss is not None else None)
-    print("num engram entries:", len(engram_aus) if engram_aus is not None else None)
+    print("num engram entries:", len(engram_aux) if engram_aux is not None else None)
 
 
     # optional minimal training loop
@@ -145,20 +143,29 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
         model.train()
         for i in range(args.steps):
-            logits, _, _, _ = model(
+            logits, _, all_load_balancing_loss, _ = model(
                 x,
                 return_router_logits=False,
-                return_load_balancing_loss=False,
+                return_load_balancing_loss=True,
                 return_engram_aux=False,
             )
             loss = F.cross_entropy(
                 logits.view(-1, vocab_size),
                 y.view(-1),
             )
+            
+            # sum the auxiliary losses from all MoE layers and scale by a coefficient e.g. 0.1
+            if all_load_balancing_loss:
+                aux_loss = sum(all_load_balancing_loss)
+            else:
+                # ensure it's a tensor on the same device as x so .backward() and / item() work safely
+                aux_loss = torch.tensor(0.0, device=x.device)
+            total_loss = loss + 0.1 * aux_loss
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
-            print(f"step {i} loss: {loss.item():.4f}")
+            print(f"step {i} loss: {total_loss.item():.4f}")
+            print(f"step {i} aux loss: {aux_loss.item():.4f}")
 
 
     # optional minimal evaluation loop
