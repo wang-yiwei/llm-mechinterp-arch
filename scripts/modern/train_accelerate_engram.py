@@ -268,7 +268,8 @@ def main():
     if args.resume_from:
         accelerator.print(f"Resuming from checkpoint: {args.resume_from}")
         accelerator.load_state(args.resume_from)
-     os.makedirs(args.output_dir, exist_ok=True)
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Training Loop ---
     global_step = 0
