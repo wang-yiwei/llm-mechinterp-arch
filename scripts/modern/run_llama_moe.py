@@ -18,7 +18,7 @@ import sys
 import torch
 
 # make repo root path available to the script
-ROOT = Path(__file__).resolve().parent[1]
+ROOT = Path(__file__).resolve().parent[2]
 sys.path.append(str(ROOT))
 
 from src.modern.llama_style_moe import LlamaStyleMoETransformerLM
