@@ -23,7 +23,7 @@ from torch.optim import AdamW
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 # Make repo root importable
-ROOT = Path(__file__).resolve().parent[2]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
 from src.data.data_loader import get_lm_dataloader
@@ -60,7 +60,7 @@ def main():
     
     # dataset
     ap.add_argument("--dataset_name_or_path", type=str, default="wikitext")
-    ap.add_argument("--dataset_config", default="wikitext:wikitext-2-v1")
+    ap.add_argument("--dataset_config", default="wikitext-2-raw-v1")
     ap.add_argument("--split_train", default="train")
     ap.add_argument("--split_eval", default="validation")
     ap.add_argument("--text_column", default="text")
@@ -77,15 +77,15 @@ def main():
     ap.add_argument("--d_model", type=int, default=256)
     ap.add_argument("--n_heads", type=int, default=4)
     ap.add_argument("--d_ff", type=int, default=1024)
-    ap.add_argument("n_layers", type=int, default=4)
+    ap.add_argument("--n_layers", type=int, default=4)
     ap.add_argument("--max_seq_len", type=int, default=256)
     ap.add_argument("--n_kv_heads", type=int, default=2)
-    ap.add_argument("rope_base", type=float, default=10000.0)
+    ap.add_argument("--rope_base", type=float, default=10000.0)
 
     # moe
     ap.add_argument("--num_experts", type=int, default=8)
     ap.add_argument("--top_k", type=int, default=2)
-    ap.add_argument("--moe_layers", default="", help="comma-separated list of layer indices, e.g. '0,1,2,3' (empty = all layers)")
+    ap.add_argument("--moe_layers", default="", help="comma-separated list of layer indices, e.g. '0,1,2,3' (empty = default)")
 
     # engram
     ap.add_argument("--use_engram", action="store_true")
@@ -102,10 +102,10 @@ def main():
 
     # optimisation
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--max_steps", type=int, default=0, help="0 = train indefinitely; >0 = train for max_steps steps")
+    ap.add_argument("--max_steps", type=int, default=0, help="0 = epoch-based; >0 => stop at max_steps")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
-    ap.add_argument("--warup_ratio", type=float, default=0.05)
+    ap.add_argument("--warmup_ratio", type=float, default=0.05)
     ap.add_argument("--grad_accum", type=int, default=1)
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -114,7 +114,7 @@ def main():
 
     # accelerator & logging
     ap.add_argument("--mixed_precision", choices=["no", "fp16", "bf16"], default="no")
-    ap.add_argument("--log_every", type-int, default=10)
+    ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--output_dir", type=str, default="checkpoints")
     ap.add_argument("--save_every", type=int, default=0, help="0 = save only at the end; >0 = save every save_every steps")
     ap.add_argument("--resume_from", type=str, default="", help="path to accelerator state checkpoint to resume from")
@@ -122,7 +122,7 @@ def main():
     args = ap.parse_args()
 
     set_seed(args.seed)
-    torch.backend.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     accelerator = Accelerator(
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
@@ -144,7 +144,7 @@ def main():
     # --- DataLoader ---
     # get_lm_dataloader expects **dataset_kwargs
     dataset_kwargs = {}
-    # Huggingface datasets use `name=` for configs like `wikitext:wikitext-2-v1`
+    # Huggingface datasets use `name=` for configs like `wikitext-2-raw-v1`
     if args.dataset_config:
         dataset_kwargs["name"] = args.dataset_config
 
@@ -188,24 +188,24 @@ def main():
         ]
         if len(vocab_sizes) != (args.max_ngram_size - 1): # checks if the number of vocabulary sizes is equal to the number of n-grams minus one
             raise ValueError(f"Expected {args.max_ngram_size - 1} vocabulary sizes, got {len(vocab_sizes)}")
-    engram_config = EngramConfig(
-        layer_ids=engram_layer_indices,
-        max_ngram_size=args.max_ngram_size,
-        n_head_per_ngram=args.n_head_per_ngram,
-        n_embed_per_ngram=args.n_embed_per_ngram,
-        vocab_size_per_ngram=vocab_sizes,
-        tokenizer_type="hf",
-        tokenizer_name_or_path=args.tokenizer_name_or_path,
-        trust_remote_code=args.trust_remote_code,
-        pad_token_id=pad_token_id,
-        use_compressed_tokenizer=args.use_compressed_tokenizer,
-        use_conv=True,
-        conv_kernel_size=args.conv_kernel_size,
-        conv_dilation=args.conv_dilation,
-        gate_signed_sqrt=args.gate_signed_sqrt,
-        seed=args.seed,
-        prime_seed_constant=args.prime_seed_constant,
-    )
+        engram_config = EngramConfig(
+            layer_ids=engram_layer_indices,
+            max_ngram_size=args.max_ngram_size,
+            n_head_per_ngram=args.n_head_per_ngram,
+            n_embed_per_ngram=args.n_embed_per_ngram,
+            vocab_size_per_ngram=vocab_sizes,
+            tokenizer_type="hf",
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+            pad_token_id=pad_token_id,
+            use_compressed_tokenizer=args.use_compressed_tokenizer,
+            use_conv=True,
+            conv_kernel_size=args.conv_kernel_size,
+            conv_dilation=args.conv_dilation,
+            gate_signed_sqrt=args.gate_signed_sqrt,
+            seed=args.seed,
+            prime_seed_constant=args.prime_seed_constant,
+        )
 
     # --- Model ---
     model = LlamaStyleEngramMoETransformerLM(
@@ -243,7 +243,7 @@ def main():
     )
 
     # --- Scheduler ---
-    # If max_step is set, use it, else compute from epochs and steps per epoch
+    # If max_steps is set, use it, else compute from epochs and steps per epoch
     if args.max_steps > 0:
         total_steps = args.max_steps
     else:
@@ -313,10 +313,16 @@ def main():
                         model.parameters(),
                         args.max_grad_norm,
                     )
+                
                 optimizer.step()
-                scheduler.step()
+                
+                # only step scheduler if the optimizer step really happened (for mixed precision training)
+                if not accelerator.optimizer_step_was_skipped:
+                    scheduler.step()
+
                 optimizer.zero_grad(set_to_none=True)
-            if accelerator.sync_gradients:
+            
+            if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
                 global_step += 1
 
                 if global_step % args.log_every == 0 and accelerator.is_main_process:
@@ -332,9 +338,10 @@ def main():
                     accelerator.save_state(checkpoint_dir)
                     accelerator.print(f"Saved checkpoint to {checkpoint_dir}")
                 
-                if args.max_step > 0 and global_step >= args.max_step:
+                if args.max_steps > 0 and global_step >= args.max_steps:
                     break
-        if args.max_step > 0 and global_step >= args.max_step:
+
+        if args.max_steps > 0 and global_step >= args.max_steps:
             break
     
         # --- Evaluation Loop ---
@@ -359,8 +366,7 @@ def main():
                     )
                     losses.append(accelerator.gather_for_metrics(loss))
             if accelerator.is_main_process:
-                val_loss = torch.cat(losses).mean().item()
-                accelerator.print(f"eval loss: {val_loss:.4f}")
+                val_loss = torch.stack(losses).mean().item()
                 accelerator.print(f"eval loss: {val_loss:.4f}")
             
             model.train()
@@ -370,7 +376,15 @@ def main():
         final_dir = os.path.join(args.output_dir, "final_model")
         os.makedirs(final_dir, exist_ok=True)
         accelerator.save_state(final_dir)
-        accelerator.print(f"Saved final model to {final_dir}")
+        accelerator.print(f"Saved final accelerator state to {final_dir}")
+
+        # save model weights in an HF-style checkpoint
+        unwrapped = accelerator.unwrap_model(model)
+        torch.save(
+            unwrapped.state_dict(),
+            os.path.join(final_dir, "final_model.pt"),
+        )
+        accelerator.print(f"Saved final model weights to {os.path.join(final_dir, 'final_model.pt')}")
     
     accelerator.print("Training completed!")
 
