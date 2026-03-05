@@ -1,4 +1,4 @@
-# src/data/data.py
+# src/data/data_loader.py
 
 # Author: Yiwei Wang
 # Date: 2026-03-04
@@ -18,7 +18,8 @@ def get_lm_dataloader(
     split: str = "train",
     seq_len: int = 2048,
     batch_size: int = 8,
-    num_workers: int = 0,
+    num_workers: int = 0,   # DataLoader workers
+    map_num_proc: int = 1,   # HF dataset.map() workers
     text_column: str = "text",
     seed: int = 0,
     drop_last: bool = True,
@@ -39,6 +40,8 @@ def get_lm_dataloader(
         dataset = dataset.shuffle(seed=seed)
     
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     def tokenize_function(examples):
         # return only input_ids to avoid carrying attention_mask around
@@ -53,7 +56,7 @@ def get_lm_dataloader(
         batched=True,
         remove_columns=dataset.column_names,
         desc="Tokenizing dataset...",
-        num_proc=num_workers,
+        num_proc=map_num_proc if map_num_proc and map_num_proc > 1 else None,
     )
 
     chunk_size = seq_len + 1 # next word prediction
@@ -76,8 +79,9 @@ def get_lm_dataloader(
         group_texts,
         batched=True,
         desc=f"Grouping texts into chunks of {chunk_size}...",
-        num_proc=num_workers,
+        num_proc=map_num_proc if map_num_proc and map_num_proc > 1 else None,
     )
+    
     lm_dataset.set_format(
         type="torch",
         columns=["input_ids"],
