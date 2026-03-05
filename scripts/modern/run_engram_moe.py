@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # make repo root importable
-ROOT = Path(__file__).resolve().parent[2]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
 
 from src.modern.engram import (
