@@ -8,5 +8,5 @@ import torch
 import torch.nn.functional as F
 
 # Make src importable
-ROOT = Path(__file__).resolve().parent[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT))
